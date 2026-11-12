@@ -1,0 +1,21 @@
+# Core training-stack versions from the previous working HAIC server.
+# fastapi/starlette are left to Isaac Sim's own requirements: the old server's
+# fastapi 0.115.7 + starlette 0.49.1 pair is not installable together.
+numpy==1.26.0
+tensordict==0.7.0
+torchrl==0.7.0
+omegaconf==2.3.1
+hydra-core==1.3.7
+# exact versions required by isaacsim-kernel 5.1.0.0 (pip check)
+click==8.1.7
+psutil==5.9.8
+websockets==12.0
+setuptools==80.9.0
+# versions from the old server that resolve the remaining pip check conflicts
+wandb==0.22.3
+packaging==23.0
+mujoco==3.13.0
+ipython==8.30.0
+# pandas >= 3.1 needs numpy >= 2; isaacsim-kernel 5.1.0.0 pins typing_extensions
+pandas==3.0.6
+typing_extensions==4.12.2

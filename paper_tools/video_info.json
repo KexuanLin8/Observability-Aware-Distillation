@@ -1,0 +1,15 @@
+{
+  "_help": "Read by scripts/make_video.py for the title card and the closing credits. Leave the lists empty and the strings blank for the double-blind version; fill them in and rebuild for the camera-ready video. Keys starting with _ are ignored.",
+  "authors": [],
+  "affiliations": [],
+  "venue": "",
+  "url": "",
+  "acknowledgment": "",
+  "_example": {
+    "authors": ["First Author", "Second Author", "Third Author"],
+    "affiliations": ["Department, University, City, Country"],
+    "venue": "IEEE Robotics and Automation Letters, 2027",
+    "url": "https://example.org/project",
+    "acknowledgment": "This work was supported by ..."
+  }
+}

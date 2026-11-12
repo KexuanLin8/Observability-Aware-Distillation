@@ -1,0 +1,416 @@
+diff --git a/active_adaptation/assets/objects.py b/active_adaptation/assets/objects.py
+index b0bc7a6..2cbca55 100644
+--- a/active_adaptation/assets/objects.py
++++ b/active_adaptation/assets/objects.py
+@@ -61,7 +61,18 @@ class WHEELArticulation(Articulation):
+             actuator.stiffness.fill_(0.0)
+             actuator.damping.fill_(0.0)
+ 
++    # False (default, upstream behaviour): the custom friction / damping acts on joint 0 only.
++    # True: the same per-env friction / damping acts on every wheel joint (object_joint_randomization(all_joints=True)).
++    _custom_all_joints = False
++
+     def write_data_to_sim(self):
++        if self._custom_all_joints:
++            j_vel = self.data.joint_vel
++            torques = (-torch.sign(j_vel) * (j_vel.abs() > 0.01) * self._custom_friction.unsqueeze(1)
++                       - j_vel * self._custom_damping.unsqueeze(1))
++            self.set_joint_effort_target(torques)
++            super().write_data_to_sim()
++            return
+         j_vel = self.data.joint_vel[:, self.custom_joint_id]
+         j_friction = -torch.sign(j_vel) * (j_vel.abs() > 0.01) * self._custom_friction
+         j_damping = -j_vel * self._custom_damping
+diff --git a/active_adaptation/envs/mdp/commands/hdmi/observations.py b/active_adaptation/envs/mdp/commands/hdmi/observations.py
+index 38b4bd3..4046c81 100644
+--- a/active_adaptation/envs/mdp/commands/hdmi/observations.py
++++ b/active_adaptation/envs/mdp/commands/hdmi/observations.py
+@@ -318,6 +318,58 @@ def yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+     yaw = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+     return yaw
+ 
++
++class robot_heading_err_imu(RobotTrackObservation):
++    """Robot heading error w.r.t. the reference root, as an onboard gyro integrator reports it.
++
++    Deployment model: at episode start the reference frame is aligned to the robot, then the
++    heading is propagated by integrating the IMU yaw rate. The measured error is therefore the
++    true heading error plus an integration error that starts at an alignment error and grows with
++    the gyro bias (episodic offset + random walk) and white rate noise:
++        err_0 ~ N(0, init_align_std),  bias_0 ~ N(0, bias_std)
++        bias  += N(0, bias_rw_std) * sqrt(dt)
++        err   += (bias + N(0, rate_noise_std)) * dt
++        e_meas = wrap(yaw_robot + err - yaw_ref)
++    Returns [cos e_meas, sin e_meas]. zero_info=True returns the constant [1, 0] (zero information,
++    identical network inputs' shape) for the capacity control. A dedicated generator keeps the
++    environment's own random streams unchanged.
++    """
++    def __init__(self, init_align_std: float = 0.01, bias_std: float = 0.002, bias_rw_std: float = 0.0005,
++                 rate_noise_std: float = 0.005, seed: int = 0, zero_info: bool = False, **kwargs):
++        super().__init__(**kwargs)
++        self.init_align_std, self.bias_std = init_align_std, bias_std
++        self.bias_rw_std, self.rate_noise_std = bias_rw_std, rate_noise_std
++        self.zero_info = zero_info
++        self._gen = torch.Generator(device=self.device)
++        self._gen.manual_seed(int(seed) + 47193)
++        self.err = torch.zeros(self.num_envs, device=self.device)
++        self.bias = torch.zeros(self.num_envs, device=self.device)
++        self.value = torch.zeros(self.num_envs, 2, device=self.device)
++        self.value[:, 0] = 1.0
++
++    def _randn(self, n):
++        return torch.randn(n, generator=self._gen, device=self.device)
++
++    def reset(self, env_ids):
++        n = len(env_ids)
++        self.err[env_ids] = self._randn(n) * self.init_align_std
++        self.bias[env_ids] = self._randn(n) * self.bias_std
++
++    def update(self):
++        dt = self.env.step_dt
++        self.bias += self._randn(self.num_envs) * (self.bias_rw_std * dt ** 0.5)
++        self.err += (self.bias + self._randn(self.num_envs) * self.rate_noise_std) * dt
++        e = wrap_to_pi(yaw_from_quat(self.command_manager.robot_root_quat_w) + self.err
++                       - yaw_from_quat(self.command_manager.ref_root_quat_w))
++        self.value = torch.stack([torch.cos(e), torch.sin(e)], dim=-1)
++
++    def compute(self):
++        if self.zero_info:
++            out = torch.zeros(self.num_envs, 2, device=self.device)
++            out[:, 0] = 1.0
++            return out
++        return self.value
++
+ RobotObjectTrackObservation = BaseObservation[RobotObjectTracking]
+ 
+ 
+@@ -517,17 +569,49 @@ class object_com_vel_b(RobotObjectTrackObservation):
+ class object_com_acc_b(RobotObjectTrackObservation):
+     """
+     Object linear and angular acceleration in robot root frame
++
++    source="physx" (default): PhysX acceleration of the last physics substep. It carries
++        contact-impulse spikes (|a| in the thousands for a few substeps) that no policy-rate
++        estimator can predict.
++    source="control_fd": finite difference of the object CoM velocity over one control step
++        (env.step_dt), i.e. the acceleration at the rate the policy acts; zero on the first
++        step after a reset.
++    clip: optional symmetric clamp applied before scale; scale: multiplies the result.
++    The defaults reproduce the original observation exactly.
+     """
+-    def __init__(self, **kwargs):
++    def __init__(self, source: str = "physx", clip: float | None = None, scale: float = 1.0, **kwargs):
+         super().__init__(**kwargs)
++        assert source in ("physx", "control_fd"), source
++        self.source = source
++        self.clip = clip
++        self.scale = scale
+         self.object_com_acc_b = torch.zeros(self.num_envs, 6, device=self.device)
++        if source == "control_fd":
++            self._prev_vel_w = self.command_manager.object.data.root_com_vel_w.clone()
++            self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
++
++    def reset(self, env_ids):
++        if self.source == "control_fd":
++            self._fresh[env_ids] = True
++
+     def update(self):
+-        object_com_acc_w = self.command_manager.object.data.body_com_acc_w[:,0] # shape: [num_envs, 6]
++        if self.source == "physx":
++            object_com_acc_w = self.command_manager.object.data.body_com_acc_w[:,0] # shape: [num_envs, 6]
++        else:
++            vel_w = self.command_manager.object.data.root_com_vel_w # shape: [num_envs, 6]
++            object_com_acc_w = (vel_w - self._prev_vel_w) / self.env.step_dt
++            object_com_acc_w[self._fresh] = 0.0
++            self._prev_vel_w = vel_w.clone()
++            self._fresh[:] = False
+         robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
+         # lin acc
+         self.object_com_acc_b[:, :3] = quat_apply_inverse(robot_root_quat_w, object_com_acc_w[:, :3])
+         # ang acc
+         self.object_com_acc_b[:, 3:] = quat_apply_inverse(robot_root_quat_w, object_com_acc_w[:, 3:])
++        if self.clip is not None:
++            self.object_com_acc_b.clamp_(-self.clip, self.clip)
++        if self.scale != 1.0:
++            self.object_com_acc_b.mul_(self.scale)
+ 
+     def compute(self):
+         return self.object_com_acc_b.view(self.num_envs, -1)
+diff --git a/active_adaptation/envs/mdp/commands/hdmi/randomizations.py b/active_adaptation/envs/mdp/commands/hdmi/randomizations.py
+index 811f84e..da5bf0e 100644
+--- a/active_adaptation/envs/mdp/commands/hdmi/randomizations.py
++++ b/active_adaptation/envs/mdp/commands/hdmi/randomizations.py
+@@ -197,12 +197,17 @@ class object_joint_randomization(RobotObjectTrackRandomization):
+         friction2_range: Tuple[float, float] | None=None,
+         damping2_range: Tuple[float, float] | None=None,
+         armature2_range: Tuple[float, float] | None=None,
++        all_joints: bool = False,  # friction / damping on every wheel joint (WHEELArticulation), not joint 0 only
+         **kwargs
+     ):
+         super().__init__(**kwargs)
+         if TYPE_CHECKING:
+             from active_adaptation.assets.objects import CustomArticulation
+         self.object: CustomArticulation = self.command_manager.object
++        if all_joints:
++            if not hasattr(self.object, '_custom_all_joints'):
++                raise ValueError(f'all_joints needs a WHEELArticulation object, got {type(self.object).__name__}')
++            self.object._custom_all_joints = True
+         if hasattr(self.object, 'num_joints'):
+             self.joint_id_asset = [i for i in range(self.object.num_joints)]
+         if self.command_manager.object2 is not None:
+diff --git a/active_adaptation/learning/ppo/ppo_haic.py b/active_adaptation/learning/ppo/ppo_haic.py
+index 05033ea..ee14283 100644
+--- a/active_adaptation/learning/ppo/ppo_haic.py
++++ b/active_adaptation/learning/ppo/ppo_haic.py
+@@ -89,6 +89,27 @@ class PPOConfig:
+     checkpoint_path: Union[str, None] = None
+     in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, OBJECT_GEO_KEY)
+ 
++    # Heading conditioning of the student side (None = off, identical to the original model).
++    # heading_to: "adapt" -> object adapter + privilege adapter (the world model),
++    #             "actor" -> student actor only, "both" -> all three.
++    # The heading observation is appended as the last input of each conditioned module; when a
++    # checkpoint without heading inputs is loaded, the new input columns are zero-initialized,
++    # so the loaded student behaves exactly as before until training changes those weights.
++    heading_key: Union[str, None] = None
++    heading_to: str = "adapt"
++
++    # Control-weighted latent alignment of the privilege adapter (stage 2 only).
++    # "none": the original unweighted MSE between priv_pred and the teacher's priv_feature.
++    # "action_jacobian": dimension d of the MSE is weighted by w_d = floor + (1 - floor) * s_d,
++    #   s_d = E_batch[ sum_a (d mu_a / d z_d)^2 ] / mean_d(...), the sensitivity of the student
++    #   actor's action mean to that latent dimension at the predicted latent; s is re-estimated
++    #   every update on priv_weight_samples transitions and smoothed with an EMA. mean(w) = 1,
++    #   so the loss scale matches the unweighted loss.
++    priv_loss_weighting: str = "none"
++    priv_weight_floor: float = 0.1
++    priv_weight_ema: float = 0.9
++    priv_weight_samples: int = 2048
++
+ cs = ConfigStore.instance()
+ cs.store("ppo_haic_train", node=PPOConfig(phase="train", vecnorm="train", entropy_coef_start=0.001, entropy_coef_end=0.001), group="algo")
+ cs.store("ppo_haic_adapt", node=PPOConfig(phase="adapt", vecnorm="eval", entropy_coef_start=0.00, entropy_coef_end=0.00), group="algo")
+@@ -239,7 +260,24 @@ class PPOHAIC(TensorDictModuleBase):
+                 adapt_module_in_keys.append(OBJECT_PRED_KEY)
+                 adapt_module_in_keys.append(OBJECT_PRED_TRANS_KEY)
+ 
++        assert self.cfg.heading_to in ("adapt", "actor", "both"), self.cfg.heading_to
++        heading_key = self.cfg.heading_key
++        if heading_key is not None:
++            assert observation_spec.get(heading_key, None) is not None, f"{heading_key} missing from observations"
++        assert self.cfg.priv_loss_weighting in ("none", "action_jacobian"), self.cfg.priv_loss_weighting
++        self._cw = self.cfg.priv_loss_weighting != "none" and self.cfg.phase == "finetune"  # other phases (e.g. the preflight teacher build) ignore it
++        if self._cw:
++            assert self.cfg.adapt_module == "mlp", "control-weighted alignment assumes the MLP privilege adapter"
++        self._priv_w_ema = None
++        self._heading_wm = heading_key is not None and self.cfg.heading_to in ("adapt", "both")
++        self._heading_actor = heading_key is not None and self.cfg.heading_to in ("actor", "both")
++        heading_wm_keys = [heading_key] if self._heading_wm else []
++        if self._heading_wm:
++            adapt_module_in_keys.append(heading_key)
++
+         object_dim = observation_spec[OBJECT_KEY].shape[-1]
++        # logging only: TransformObject reads the final 12 dims per object as the pose
++        self._object_pose_dims = 12 * (observation_spec[OBJECT_GEO_KEY].shape[-1] // (128 * 3))
+         latent_dim = self.cfg.latent_dim
+         # For gt object transform
+         self.object_transform = Seq(
+@@ -250,7 +288,7 @@ class PPOHAIC(TensorDictModuleBase):
+             TransformObject(object_dim, [OBJECT_PRED_KEY, OBJECT_GEO_KEY], [OBJECT_PRED_TRANS_KEY]),
+         ).to(self.device)
+         self.object_adapt = Seq(
+-            CatTensors([OBS_KEY, CMD_KEY], "_object_adapt_inp", del_keys=False, sort=False),
++            CatTensors([OBS_KEY, CMD_KEY] + heading_wm_keys, "_object_adapt_inp", del_keys=False, sort=False),
+             Mod(nn.Sequential(make_mlp([latent_dim, latent_dim]), nn.LazyLinear(object_dim)), "_object_adapt_inp", OBJECT_PRED_KEY),
+             selected_out_keys=[OBJECT_PRED_KEY]
+         ).to(self.device)
+@@ -318,6 +356,8 @@ class PPOHAIC(TensorDictModuleBase):
+             in_keys = [CMD_KEY, OBS_KEY, "priv_est"]
+         else:
+             in_keys = [CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
++        if self._heading_actor:
++            in_keys = in_keys + [heading_key]
+         self.actor_adapt = build_actor(in_keys, self.dist_cls, self.dist_keys)
+ 
+         # build critic
+@@ -572,6 +612,29 @@ class PPOHAIC(TensorDictModuleBase):
+             infos[f"critic/{group_name}.neg_rew_ratio"] = (tensordict[REWARD_KEY][:, :, i] <= 0.).float().mean().item()
+         return dict(sorted(infos.items()))
+     
++    def _priv_latent_weights(self, tensordict: TensorDict):
++        """Per-dimension weights for the privilege-adapter loss (see PPOConfig.priv_loss_weighting)."""
++        flat = tensordict.reshape(-1)
++        n = min(self.cfg.priv_weight_samples, flat.shape[0])
++        sub = flat[torch.randperm(flat.shape[0], device=flat.device)[:n]].clone()
++        with torch.no_grad():
++            self.object_adapt(sub)
++            self.object_pred_transform(sub)
++            self.adapt_module(sub)
++        z = sub[PRIV_PRED_KEY].detach().requires_grad_(True)
++        sub[PRIV_PRED_KEY] = z
++        with torch.enable_grad():
++            loc = self.actor_adapt.get_dist(sub).mean
++            g2 = torch.zeros(z.shape[-1], device=z.device)
++            for a in range(loc.shape[-1]):
++                (g,) = torch.autograd.grad(loc[:, a].sum(), z, retain_graph=a < loc.shape[-1] - 1)
++                g2 += g.square().mean(0)
++        s = g2 / g2.mean().clamp_min(1e-12)
++        ema = self.cfg.priv_weight_ema
++        self._priv_w_ema = s if self._priv_w_ema is None else ema * self._priv_w_ema + (1 - ema) * s
++        floor = self.cfg.priv_weight_floor
++        return (floor + (1 - floor) * self._priv_w_ema).detach()
++
+     @set_recurrent_mode(True)
+     def train_adapt(self, tensordict: TensorDict):
+         infos = []
+@@ -579,16 +642,26 @@ class PPOHAIC(TensorDictModuleBase):
+         with torch.no_grad():
+             self.object_transform(tensordict)
+             self.encoder_priv(tensordict)
++        priv_w = self._priv_latent_weights(tensordict) if self._cw else None
+ 
+         for epoch in range(2):
+             for minibatch in make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every):
+                 self.object_adapt(minibatch)
+                 object_loss = self.adapt_loss_fn(minibatch[OBJECT_PRED_KEY], minibatch[OBJECT_KEY])
+-                object_loss = (object_loss * (~minibatch["is_init"])).mean()
++                object_loss = object_loss * (~minibatch["is_init"])
++                with torch.no_grad():
++                    pose_dims = self._object_pose_dims
++                    object_loss_pose = object_loss[..., -pose_dims:].mean()
++                    object_loss_other = object_loss[..., :-pose_dims].mean() if object_loss.shape[-1] > pose_dims else torch.zeros((), device=object_loss.device)
++                object_loss = object_loss.mean()
+ 
+                 self.object_pred_transform(minibatch)
+                 self.adapt_module(minibatch)
+                 priv_loss = self.adapt_loss_fn(minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY])
++                if priv_w is not None:
++                    with torch.no_grad():
++                        priv_loss_unweighted = (priv_loss * (~minibatch["is_init"])).mean()
++                    priv_loss = priv_loss * priv_w
+                 priv_loss = (priv_loss * (~minibatch["is_init"])).mean()
+                 
+                 total_loss = priv_loss + object_loss
+@@ -603,6 +676,12 @@ class PPOHAIC(TensorDictModuleBase):
+                 info = {}
+                 info["adapt/priv_loss"] = priv_loss
+                 info["adapt/object_loss"] = object_loss
++                info["adapt/object_loss_pose"] = object_loss_pose
++                if priv_w is not None:
++                    info["adapt/priv_loss_unweighted"] = priv_loss_unweighted
++                    info["adapt/priv_w_max"] = priv_w.max()
++                    info["adapt/priv_w_eff_dims"] = priv_w.sum().square() / priv_w.square().sum()
++                info["adapt/object_loss_other"] = object_loss_other
+                 info["adapt/grad_norm"] = opt_adapt_grad_norm
+                 info["adapt/priv_feature_norm"] = minibatch[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean()
+                 info["adapt/priv_pred_norm"] = minibatch[PRIV_PRED_KEY].norm(p=2, dim=-1).mean()
+@@ -836,13 +915,47 @@ class PPOHAIC(TensorDictModuleBase):
+         state_dict["last_phase"] = self.cfg.phase
+         state_dict["last_iter"] = self.env.current_iter
+         state_dict["lr_policy"] = self.lr_policy
++        if self.cfg.heading_key is not None:
++            state_dict["heading_cfg"] = self._heading_schema()
+         return state_dict
+-    
++
++    def _heading_schema(self):
++        return {"key": self.cfg.heading_key, "to": self.cfg.heading_to,
++                "dim": int(self.observation_spec[self.cfg.heading_key].shape[-1])}
++
++    def _pad_heading_inputs(self, name, module, sd):
++        """Zero-extend input columns of first layers that gained the heading input."""
++        own = module.state_dict()
++        dim = self._heading_schema()["dim"]
++        out = OrderedDict()
++        for k, v in sd.items():
++            cur = own.get(k)
++            if (cur is not None and v.ndim == 2 and cur.ndim == 2 and cur.shape[0] == v.shape[0]
++                    and cur.shape[1] == v.shape[1] + dim):
++                v = torch.cat([v, torch.zeros(v.shape[0], dim, dtype=v.dtype, device=v.device)], dim=1)
++                print(f"[heading] {name}.{k}: zero-initialized {dim} new input columns")
++            out[k] = v
++        return out
++
+     def load_state_dict(self, state_dict, strict=True):
++        ckpt_heading = state_dict.get("heading_cfg")
++        pad_heading = False
++        if self.cfg.heading_key is not None:
++            if ckpt_heading is None:
++                if state_dict.get("last_phase") != "train":
++                    raise RuntimeError("heading model can only be initialized from a stage-1 (train) checkpoint "
++                                       "without heading inputs, or from a checkpoint with the same heading_cfg")
++                pad_heading = True
++            elif ckpt_heading != self._heading_schema():
++                raise RuntimeError(f"heading_cfg mismatch: checkpoint {ckpt_heading} vs model {self._heading_schema()}")
++        elif ckpt_heading is not None:
++            raise RuntimeError(f"checkpoint has heading inputs {ckpt_heading}; set algo.heading_key accordingly")
+         succeed_keys = []
+         failed_keys = []
+         for name, module in self.named_children():
+             _state_dict = state_dict.get(name, {})
++            if pad_heading and name in ("object_adapt", "object_adapt_ema", "adapt_module", "adapt_ema", "actor_adapt"):
++                _state_dict = self._pad_heading_inputs(name, module, _state_dict)
+             try:
+                 module.load_state_dict(_state_dict, strict=strict)
+                 succeed_keys.append(name)
+diff --git a/cfg/task/G1/haic/box_stairslope.yaml b/cfg/task/G1/haic/box_stairslope.yaml
+index 921ea25..a65a921 100644
+--- a/cfg/task/G1/haic/box_stairslope.yaml
++++ b/cfg/task/G1/haic/box_stairslope.yaml
+@@ -58,7 +58,7 @@ randomization:
+     scale_range: [[0.9, 1.1], [0.98, 1.02]]
+ 
+ reward:
+-  tracking:
++  # tracking: (upstream left an empty 'tracking:' key here, which YAML reads as null and which crashed environment construction; removed so the hdmi-base tracking rewards apply, as in box_stair / box_slope)
+     # tracking_upper_body_pos(keypoint_pos_tracking_product):
+     #   body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+     #   weight: 0.5
+diff --git a/scripts/train.py b/scripts/train.py
+index d6e8404..40011c8 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -34,6 +34,18 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
+ 
+ @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
+ def main(cfg: DictConfig):
++    try:
++        _main(cfg)
++    except BaseException:
++        # Isaac Sim's shutdown can hang after an exception; report and exit right away
++        import sys
++        import traceback
++        traceback.print_exc()
++        sys.stdout.flush(); sys.stderr.flush()
++        os._exit(1)
++
++
++def _main(cfg: DictConfig):
+     OmegaConf.resolve(cfg)
+     OmegaConf.set_struct(cfg, False)
+     
+@@ -54,15 +66,22 @@ def main(cfg: DictConfig):
+     run.config.update(OmegaConf.to_container(cfg))
+     
+     default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+-    run_idx = run.name.split("-")[-1]
++    run_idx = (run.name or run.id).split("-")[-1]  # run.name is None for offline runs
+     run.name = f"{run_idx}-{default_run_name}"
+-    setproctitle(run.name)
++    setproctitle(f"{run_idx}-{default_run_name}")
+ 
+     cfg_save_path = os.path.join(run.dir, "cfg.yaml")
+     OmegaConf.save(cfg, cfg_save_path)
+     run.save(cfg_save_path, policy="now")
+     run.save(os.path.join(run.dir, "config.yaml"), policy="now")
+ 
++    # Seed every RNG before the environment is built, so creation-time domain
++    # randomization and network initialization are reproducible for a given seed.
++    import random
++    random.seed(cfg.seed)
++    np.random.seed(cfg.seed)
++    torch.manual_seed(cfg.seed)
++    torch.cuda.manual_seed_all(cfg.seed)
+     env, policy, vecnorm = make_env_policy(cfg)
+ 
+     import inspect
