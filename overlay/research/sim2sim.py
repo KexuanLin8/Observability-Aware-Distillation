@@ -170,6 +170,13 @@ def run_episode(job):
             model.geom_friction[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'floor'), 0] = float(v)
         elif k in ('isaac_assets', 'golden_init', 'heading_null'):
             pass  # applied to the spec before compiling
+        elif k == 'wheel_mu':  # wheel-ground sliding friction. Isaac combines the ground (1.0) and the wheel material
+            # by multiplication, so the wheels slide with their own dynamic friction (0.01-0.1, static x30-60);
+            # the scene uses the default 1.0. The wheel geoms get priority so that their friction is the contact's.
+            for j in range(model.ngeom):
+                if model.geom(j).name.endswith('_wheel'):
+                    model.geom_friction[j, 0] = float(v)
+                    model.geom_priority[j] = 1
         elif k == 'deck_mu':  # sliding friction of the deck (Isaac: dynamic 1.5-3.0, static x1-2)
             model.geom_friction[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'board_deck'), 0] = float(v)
         elif k == 'board_scale':  # homogeneous object scale (Isaac: body_scale 0.8-1.1), geometry only
@@ -511,8 +518,9 @@ def main():
                       f'{100 * s["drift_tolerant_success_rate"]:.1f}%, fell {100 * s["fell_rate"]:.1f}%, '
                       f'along-track at 9 s {s["median_along_cal_m"]:+.2f} m', flush=True)
     if summary:
-        name = f'sim2sim{tag}.json'
-        (a.export / name).write_text(json.dumps(summary, indent=2), encoding='utf-8')
+        path = a.export / f'sim2sim{tag}.json'
+        old = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}  # keep other arms' entries
+        path.write_text(json.dumps({**old, **summary}, indent=2), encoding='utf-8')
 
 
 if __name__ == '__main__':

@@ -108,6 +108,9 @@ A student takes about 9-12 h on one RTX 4090. `python research/diagnose.py` writ
 `research/sim2sim.py` evaluates them in the MuJoCo scenes of [HOIC-baseline](https://github.com/Cybercal/HOIC-baseline)
 with the observation builder checked term by term against Isaac (`--check`). The evaluation protocol, fixed before the
 results, is in `research/SIM2SIM_PROTOCOL.md`.
+In MuJoCo the heading students track the reference better where the board can drift, but they fall more often than
+HAIC during fast pushing (see the paper and the protocol file); `research/sim2sim_report.py` and
+`research/sim2sim_falls.py` reproduce these numbers and the fall analysis.
 
 **Figures, tables and video.** `paper_tools/make_figures.py` builds every figure, table and number of the paper from the
 `metrics.json` files; `paper_tools/make_video.py` builds the supplementary video from the rendered showcase episodes.

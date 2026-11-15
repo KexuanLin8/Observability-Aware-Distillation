@@ -501,19 +501,20 @@ def three_min():
                         [(0, 'Not every episode is saved: here OH-Both fails where HAIC succeeds. The heading removes lateral drift, not along-track drift.')], speed=1.25)),
     ]
     if all(p.is_file() for p in MUJOCO.values()):
-        s.append(('In a second simulator, MuJoCo, the gain does not transfer. Here our student falls during fast '
-                  'pushing, and two of our three skateboard students fall in most episodes. We report this as a limitation.',
+        s.append(('In a second simulator, MuJoCo, each push gives the board less speed. '
+                  f'{HAIC} adapts its pushing, while our student keeps its stance and often falls, as here. '
+                  'Where the board can drift, the heading still pays off. We report the falls as a limitation.',
                   lambda: side_by_side(MUJOCO, 'Second simulator: MuJoCo', [
                       (0, 'The same students in MuJoCo (no retraining). The push accelerates the board less than in Isaac Sim.'),
-                      (5, 'Here HAIC completes the episode and OH-Both falls during fast pushing: two of the three OH-Both students '
-                          'fall in most MuJoCo episodes, so the gain measured in Isaac Sim is not shown to transfer.')],
+                      (5, 'Here HAIC completes the episode and OH-Both falls during fast pushing: the heading students push '
+                          'less robustly under the different contact dynamics.')],
                       sub='Skateboarding, student 2, episode 0', ended={'dyn-hboth': 'fell'})))
     s += [
         ('All results are in simulation, and the sensor model still has to be validated on the robot.',
          lambda: card([('Limitations', 50, 'b', INK),
                        ('All results are in simulation; the sensor model must be validated on the robot.', 38, 'r', INK),
                        ('Along-track drift remains unobservable to a proprioceptive student.', 38, 'r', INK),
-                       ('In MuJoCo, two of three OH-Both skateboard students fall during fast pushing.', 38, 'r', INK)], 6)),
+                       ('In MuJoCo, the heading students fall more often than HAIC during fast pushing.', 38, 'r', INK)], 6)),
         ('One onboard signal, the I.M.U.-integrated heading, recovers most of the teacher-student gap on three tasks.',
          lambda: card([('One onboard signal, the IMU-integrated heading,', 50, 'b', INK),
                        ('recovers most of the teacher-student gap on three tasks.', 50, 'b', INK),
